@@ -1,0 +1,205 @@
+// Command eventstats reads a JSONL file of campaign events and prints
+// per-campaign statistics.
+//
+// Requirements (see README.md):
+//   1. Each event_id must be counted at most once across the whole file.
+//   2. unique_opens = number of distinct contacts that opened, per campaign.
+//   3. Daily delivered buckets use the event's UTC date.
+//   4. Output must be identical across runs on the same input.
+//
+// Usage: go run . events.jsonl
+package main
+
+import (
+	"bufio"
+	"encoding/json"
+	"fmt"
+	"os"
+	"sort"
+	"sync"
+	"time"
+)
+
+type Event struct {
+	EventID    string    `json:"event_id"`
+	CampaignID string    `json:"campaign_id"`
+	ContactID  string    `json:"contact_id"`
+	Type       string    `json:"type"`
+	Timestamp  time.Time `json:"timestamp"`
+}
+
+type CampaignStats struct {
+	mu             sync.Mutex // BUG 4 FIX: protects concurrent counter updates in apply()
+	Sent           int
+	Delivered      int
+	Opened         int
+	Clicked        int
+	UniqueOpens    int
+	DailyDelivered map[string]int
+}
+
+// stats records are created before the workers run, so the map itself is
+// never written concurrently.
+var stats = map[string]*CampaignStats{}
+
+// openedBy remembers which contacts have already opened, so repeat opens by
+// the same contact do not inflate unique_opens. It is only touched from
+// track(), which runs on the main goroutine.
+// BUG 2 FIX: key is "campaignID/contactID" so unique_opens is tracked
+// per campaign, not globally across all campaigns.
+var openedBy = map[string]bool{}
+
+// BUG 1 FIX: seen is now a package-level variable so deduplication works
+// across all batches, not just within a single batch.
+var seen = map[string]bool{}
+
+const (
+	batchSize  = 200
+	numWorkers = 8
+)
+
+func main() {
+	if len(os.Args) < 2 {
+		fmt.Fprintln(os.Stderr, "usage: go run . <events.jsonl>")
+		os.Exit(1)
+	}
+	f, err := os.Open(os.Args[1])
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(1)
+	}
+	defer f.Close()
+
+	scanner := bufio.NewScanner(f)
+	scanner.Buffer(make([]byte, 1024*1024), 1024*1024)
+
+	batch := make([]Event, 0, batchSize)
+	for scanner.Scan() {
+		line := scanner.Bytes()
+		if len(line) == 0 {
+			continue
+		}
+		var ev Event
+		if err := json.Unmarshal(line, &ev); err != nil {
+			fmt.Fprintf(os.Stderr, "skipping bad line: %v\n", err)
+			continue
+		}
+		batch = append(batch, ev)
+		if len(batch) == batchSize {
+			processBatch(batch)
+			batch = make([]Event, 0, batchSize)
+		}
+	}
+	if err := scanner.Err(); err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(1)
+	}
+	if len(batch) > 0 {
+		processBatch(batch)
+	}
+
+	printReport()
+}
+
+// processBatch de-duplicates a batch, runs the map-based tracking that needs
+// ordered access, then fans the counter updates out to a worker pool. The
+// counters are plain ints, so the increments themselves are cheap.
+func processBatch(events []Event) {
+	// BUG 1 FIX: use the package-level seen map (not a local one) so that
+	// duplicate event_ids spanning multiple batches are still caught.
+	unique := make([]Event, 0, len(events))
+	for _, ev := range events {
+		if seen[ev.EventID] {
+			continue
+		}
+		seen[ev.EventID] = true
+		if _, ok := stats[ev.CampaignID]; !ok {
+			stats[ev.CampaignID] = &CampaignStats{DailyDelivered: map[string]int{}}
+		}
+		track(ev)
+		unique = append(unique, ev)
+	}
+
+	jobs := make(chan Event)
+	var wg sync.WaitGroup
+	for i := 0; i < numWorkers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for ev := range jobs {
+				apply(ev)
+			}
+		}()
+	}
+	for _, ev := range unique {
+		jobs <- ev
+	}
+	close(jobs)
+	wg.Wait()
+}
+
+// track owns unique-open tracking and daily delivery buckets. Maps are not
+// safe for concurrent use, so this runs before the workers are started.
+func track(ev Event) {
+	cs := stats[ev.CampaignID]
+	switch ev.Type {
+	case "opened":
+		// BUG 2 FIX: use "campaignID/contactID" as key so that unique_opens
+		// is counted per campaign. Previously the key was only contactID,
+		// causing a contact's opens in a second campaign to be silently skipped.
+		key := ev.CampaignID + "/" + ev.ContactID
+		if !openedBy[key] {
+			openedBy[key] = true
+			cs.UniqueOpens++
+		}
+	case "delivered":
+		// BUG 3 FIX: use UTC, not Local. The spec says daily buckets use the
+		// event's UTC date. .Local() could shift the date depending on the
+		// machine's timezone, producing wrong bucket keys.
+		day := ev.Timestamp.UTC().Format("2006-01-02")
+		cs.DailyDelivered[day]++
+	}
+}
+
+// apply updates the counters for a single event. The stats record always
+// exists at this point.
+func apply(ev Event) {
+	cs := stats[ev.CampaignID]
+	// BUG 4 FIX: apply() is called from multiple goroutines concurrently.
+	// Without a lock, concurrent increments to the same int field are a
+	// data race and can silently drop counts. Lock per CampaignStats so
+	// campaigns do not block each other unnecessarily.
+	cs.mu.Lock()
+	defer cs.mu.Unlock()
+	switch ev.Type {
+	case "sent":
+		cs.Sent++
+	case "delivered":
+		cs.Delivered++
+	case "opened":
+		cs.Opened++
+	case "clicked":
+		cs.Clicked++
+	}
+}
+
+func printReport() {
+	names := make([]string, 0, len(stats))
+	for name := range stats {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	for _, name := range names {
+		cs := stats[name]
+		fmt.Printf("campaign=%s sent=%d delivered=%d opened=%d clicked=%d unique_opens=%d\n",
+			name, cs.Sent, cs.Delivered, cs.Opened, cs.Clicked, cs.UniqueOpens)
+		days := make([]string, 0, len(cs.DailyDelivered))
+		for day := range cs.DailyDelivered {
+			days = append(days, day)
+		}
+		sort.Strings(days)
+		for _, day := range days {
+			fmt.Printf("  %s delivered=%d\n", day, cs.DailyDelivered[day])
+		}
+	}
+}
